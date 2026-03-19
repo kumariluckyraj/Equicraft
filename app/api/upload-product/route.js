@@ -1,5 +1,8 @@
-// File: app/api/upload-product/route.mjs
-export const runtime = "nodejs";
+"use server";
+// app/api/upload-product/route.js
+// ensures server runtime
+
+ // important: prevent client-side bundling
 
 import connectDB from "@/db/connectDb";
 import Product from "@/models/Product";
@@ -24,33 +27,28 @@ function averageEmbedding(tensor) {
     }
     return avg.map((v) => v / tokens);
   }
-
   return [];
 }
 
-// -------------------- Load Transformers Pipelines --------------------
+// -------------------- Lazy load Transformers (WASM only) --------------------
 let textEmbedder, imageClassifier, llmPipeline;
-
 async function loadPipelines() {
-  if (!textEmbedder) {
-    const transformers = await import("@xenova/transformers");
-
+  if (!textEmbedder || !imageClassifier || !llmPipeline) {
+    const transformers = await import("@xenova/transformers"); // dynamic import
     textEmbedder = await transformers.pipeline(
       "feature-extraction",
       "Xenova/all-MiniLM-L12-v2",
-      { backend: "cpu" }
+      { backend: "wasm" }
     );
-
     imageClassifier = await transformers.pipeline(
       "zero-shot-image-classification",
       "Xenova/clip-vit-base-patch32",
-      { backend: "cpu" }
+      { backend: "wasm" }
     );
-
     llmPipeline = await transformers.pipeline(
       "text-generation",
       "Xenova/distilgpt2",
-      { backend: "cpu" }
+      { backend: "wasm" }
     );
   }
   return { textEmbedder, imageClassifier, llmPipeline };
@@ -71,13 +69,13 @@ export async function POST(req) {
     // -------------------- Text Embedding --------------------
     const textEmbeddingRaw = await textEmbedder(description + " " + materials);
     const textEmbedding = averageEmbedding(textEmbeddingRaw);
+
     if (textEmbedding.length !== 384) {
       return new Response(JSON.stringify({ error: `Embedding mismatch: ${textEmbedding.length} != 384` }), { status: 500 });
     }
 
-    // -------------------- Image Classification (in-memory) --------------------
+    // -------------------- Image Classification --------------------
     const imageBuffer = Buffer.from(imageBase64.replace(/^data:image\/\w+;base64,/, ""), "base64");
-
     const labels = [
       "plastic object",
       "ceramic clay pottery",
@@ -86,91 +84,60 @@ export async function POST(req) {
       "glass object",
       "eco friendly handmade product",
     ];
-
     const result = await imageClassifier(imageBuffer, labels);
     const plasticScore = result.find((r) => r.label === "plastic object")?.score || 0;
     const isPlastic = plasticScore > 0.4;
 
-    let allowSubmit = true;
-    let plasticWarning = "";
-    if (isPlastic) {
-      allowSubmit = false;
-      plasticWarning = `⚠️ Image suggests plastic (confidence: ${plasticScore.toFixed(2)})`;
-    }
+    let allowSubmit = !isPlastic;
+    let plasticWarning = isPlastic ? `⚠️ Image suggests plastic (confidence: ${plasticScore.toFixed(2)})` : "";
 
-    // -------------------- Material check --------------------
     const materialsText = materials.toLowerCase();
     if (isPlastic && materialsText.includes("clay")) {
       plasticWarning += "\n⚠️ Mismatch: Image looks plastic but materials say clay.";
       allowSubmit = false;
     }
 
-    // -------------------- Store in Pinecone --------------------
+    // -------------------- Pinecone Upsert --------------------
     await index.upsert([{
       id: Date.now().toString(),
       values: textEmbedding,
       metadata: { name, description, materials, ecoImpact, artistStory, culturalMeaning, price },
     }]);
 
-    // -------------------- RAG Retrieval --------------------
-    const queryResponse = await index.query({ vector: textEmbedding, topK: 5, includeMetadata: true });
-    const topResults = queryResponse.matches.map(m => ({ text: m.metadata?.description || "No description", score: m.score }));
-    const contextText = topResults.map((k, i) => `Knowledge ${i + 1}: ${k.text}`).join("\n");
-
-    // -------------------- Decision --------------------
-    let ecoDecision = "UNKNOWN";
-    if (isPlastic) ecoDecision = "NOT_ECO";
-    else if (["clay","wood","bamboo","natural"].some(m => materialsText.includes(m))) ecoDecision = "ECO";
-    else if (["metal","glass"].some(m => materialsText.includes(m))) ecoDecision = "PARTIAL";
-
-    // -------------------- Save to MongoDB --------------------
-    if (allowSubmit && ecoDecision !== "NOT_ECO") {
-      await connectDB();
-      await Product.create({ name, description, materials, ecoImpact, artistStory, culturalMeaning, price: Number(price), image: imageBase64, ecoDecision });
-    }
-
     // -------------------- LLM Explanation --------------------
-    const prompt = `
-Explain in 2-3 short lines why this product is ${ecoDecision}.
+    const prompt = `Explain in 2-3 short lines why this product is eco-friendly.
 
 Product: ${description}
-Materials: ${materials}
-Context: ${contextText}
-`;
+Materials: ${materials}`;
     const ragResult = await llmPipeline(prompt, { max_new_tokens: 60, temperature: 0.5 });
     let generatedText = Array.isArray(ragResult) ? ragResult[0].generated_text : ragResult.generated_text;
     let explanation = generatedText.replace(prompt, "").trim();
+
     if (!explanation || explanation.length < 20) {
-      if (ecoDecision === "NOT_ECO") explanation = "This product is not eco-friendly because it likely contains plastic which harms the environment.";
-      else if (ecoDecision === "ECO") explanation = "This product is eco-friendly as it uses natural and sustainable materials.";
-      else if (ecoDecision === "PARTIAL") explanation = "This product is partially eco-friendly since materials like metal or glass are recyclable.";
-      else explanation = "Eco-friendliness cannot be determined.";
+      explanation = isPlastic
+        ? "This product is not eco-friendly because it likely contains plastic."
+        : "This product is eco-friendly as it uses natural and sustainable materials.";
     }
 
-    // -------------------- Final Response --------------------
-    const ecoAnalysis = `
-Decision: ${ecoDecision}
+    // -------------------- Save to MongoDB --------------------
+    if (allowSubmit) {
+      await connectDB();
+      await Product.create({
+        name, description, materials, ecoImpact, artistStory, culturalMeaning,
+        price: Number(price),
+        image: imageBase64,
+        ecoDecision: isPlastic ? "NOT_ECO" : "ECO"
+      });
+    }
 
-Context:
-${contextText}
+    return new Response(JSON.stringify({
+      success: true,
+      explanation,
+      allowSubmit,
+      plasticInfo: { isPlastic, score: plasticScore },
+      plasticWarning
+    }), { status: 200 });
 
-Product:
-Name: ${name}
-Description: ${description}
-Materials: ${materials}
-
-Explanation:
-${explanation}
-
-${plasticWarning ? plasticWarning : ""}
-
-Related Knowledge:
-${topResults.map(k => k.text).join("\n")}
-
-${allowSubmit ? "✅ Eco-friendly. Can submit." : "❌ Not eco-friendly. Cannot submit."}
-`.trim();
-
-    return new Response(JSON.stringify({ success: true, ecoAnalysis, relatedKnowledge: topResults, allowSubmit, plasticInfo: { isPlastic, score: plasticScore } }), { status: 200 });
   } catch (error) {
     console.error("Upload Error:", error);
     return new Response(JSON.stringify({ error: error.message || "Failed to process product" }), { status: 500 });
